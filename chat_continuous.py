@@ -70,6 +70,10 @@ def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dt
             model.fiber_proj.load_state_dict(ckpt["fiber_proj"], strict=False)
         if "episodic_memory" in ckpt and isinstance(ckpt["episodic_memory"], dict):
             model.episodic_memory.load_state_dict(ckpt["episodic_memory"], strict=False)
+        if hasattr(model, 'fiber_bundle') and "fiber_state" in ckpt:
+            model.fiber_bundle.load_state_dict(ckpt["fiber_state"], strict=False)
+        if hasattr(model, 'sparse_bias') and "sparse_bias_state" in ckpt:
+            model.sparse_bias.load_state_dict_differential(ckpt["sparse_bias_state"])
             
         print("    Sidecar loaded.")
     else:
@@ -668,6 +672,9 @@ def main():
             }
             if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
                 save_dict["fiber_state"] = model.fiber_bundle.state_dict()
+            if hasattr(model, 'sparse_bias') and model.sparse_bias is not None:
+                save_dict["sparse_bias_state"] = model.sparse_bias.state_dict_differential()
+
             torch.save(save_dict, args.sidecar)
             print(f"[*] Saved to {args.sidecar}. Exiting.")
             break
@@ -724,6 +731,9 @@ def main():
                 }
                 if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
                     save_dict["fiber_state"] = model.fiber_bundle.state_dict()
+                if hasattr(model, 'sparse_bias') and model.sparse_bias is not None:
+                    save_dict["sparse_bias_state"] = model.sparse_bias.state_dict_differential()
+                    
                 torch.save(save_dict, args.sidecar + ".latest")
         except ValueError:
             print("[System] Invalid reward, skipping update.")

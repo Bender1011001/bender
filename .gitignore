@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+.pytest_cache/
+.coverage
+.venv/
+venv/
+.env
+
+# IDE
+.vscode/
+.idea/
+
+# Model weights and checkpoints (too large for git — use HuggingFace instead)
+*.pt
+*.pth
+*.safetensors
+*.bin
+checkpoints/
+
+# Training data
+*.jsonl
+datasets_cache/
+
+# Logs and output
+*.log
+logs/*.log
+
+# OS
+.DS_Store
+Thumbs.db

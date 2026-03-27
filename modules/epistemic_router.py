@@ -82,14 +82,15 @@ class EpistemicRouter(nn.Module):
         if self.training:
             with torch.no_grad():
                 batch_mean = ebm_energy.mean()
+                ema_device = ebm_energy.device
                 # Exponential moving average update
                 new_ema = (
-                    self.ema_decay * self.energy_threshold_ema
+                    self.ema_decay * self.energy_threshold_ema.to(ema_device)
                     + (1.0 - self.ema_decay) * batch_mean
                 )
-                self.energy_threshold_ema.copy_(new_ema)
+                self.energy_threshold_ema = new_ema
 
-        return torch.sigmoid((ebm_energy - self.energy_threshold_ema) / self.tau_e)
+        return torch.sigmoid((ebm_energy - self.energy_threshold_ema.to(ebm_energy.device)) / self.tau_e)
 
     def route_gradients(
         self,

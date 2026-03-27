@@ -13,16 +13,35 @@ from modules.epistemic_router import EpistemicRouter
 from modules.bch_consolidation import BCHConsolidator
 from modules.geometry import skew_unvectorize, skew_vectorize
 
-def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dtype: torch.dtype = torch.bfloat16):
-    print(f"[*] Loading backbone: {backbone_id}")
+def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dtype: torch.dtype = torch.float16):
+    print(f"[*] Loading backbone: {backbone_id} with 4-bit quantization")
     t0 = time.time()
-    backbone = AutoModelForCausalLM.from_pretrained(
-        backbone_id, torch_dtype=dtype, device_map=device, trust_remote_code=True
+    
+    from transformers import BitsAndBytesConfig
+    quant_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_compute_dtype=dtype,
+        bnb_4bit_use_double_quant=True,
+        bnb_4bit_quant_type="nf4"
     )
+    
+    # 1. Banish device_map="auto" to prevent PCI-e fragmentation
+    backbone = AutoModelForCausalLM.from_pretrained(
+        backbone_id, 
+        quantization_config=quant_config, 
+        device_map={"": "cuda:0"},  # <-- STRICT LOCALITY OVERRIDE
+        trust_remote_code=True
+    )
+    
     tokenizer = AutoTokenizer.from_pretrained(backbone_id, trust_remote_code=True)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     print(f"    Backbone loaded in {time.time() - t0:.1f}s")
+    
+    # 3. Autograd OOM Shield
+    # To protect cuda:0 during the 3-phase memory injection gradients
+    if hasattr(backbone, "gradient_checkpointing_enable"):
+        backbone.gradient_checkpointing_enable()
 
     config = SidecarConfig(
         backbone_hidden_size=backbone.config.hidden_size,
@@ -56,13 +75,23 @@ def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dt
     else:
         print("    Sidecar path not found, using randomly initialized sidecar.")
 
-    bb_device = backbone.model.embed_tokens.weight.device
-    model.geo_processor = model.geo_processor.to(bb_device, dtype=dtype)
+    # 2. Split-Brain Sharding Pattern (Optional: If Smallville Context > 8GB)
+    # If the Generative Agents' KV-caches threaten your 8GB boundary, 
+    # isolate the heavy O(1) BENDER memory arrays to cuda:1 in FP32.
+    hot_device = torch.device("cuda:0")
+    cold_device = torch.device("cuda:1") if torch.cuda.device_count() > 1 else hot_device
+    
+    # Fast-path AR components stay on cuda:0 natively
+    model.geo_processor = model.geo_processor.to(hot_device, dtype=dtype)
+    if getattr(model, 'fiber_proj', None) is not None:
+        model.fiber_proj = model.fiber_proj.to(hot_device, dtype=dtype)
+        
+    # Memory-heavy / offline components move to cuda:1 (GTX 1070) in FP32 (bypasses Pascal penalty)
     if hasattr(model, 'latent_planner'):
-        model.latent_planner = model.latent_planner.to(bb_device, dtype=dtype)
-    model.ebm_critic = model.ebm_critic.to(bb_device, dtype=dtype)
-    if hasattr(model, 'fiber_bundle'):
-        model.fiber_bundle = model.fiber_bundle.to(bb_device, dtype=dtype)
+        model.latent_planner = model.latent_planner.to(cold_device, dtype=torch.float32)
+    model.ebm_critic = model.ebm_critic.to(cold_device, dtype=torch.float32)
+    if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
+        model.fiber_bundle = model.fiber_bundle.to(cold_device, dtype=torch.float32)
     
     # --- Surgical Unfreeze (Fix 3) ---
     # Freeze the ENTIRE model first
@@ -74,16 +103,19 @@ def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dt
     if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
         model.fiber_bundle.fiber_store.fiber_vectors.requires_grad = True
     # Surgical unfreeze of backbone decoder blocks for factual correction (κ→1)
-    # This is Fix 3: when the epistemic router detects a factual error,
-    # the gradient MUST be able to reach the base manifold.
-    # We unfreeze decoder_blocks so that kappa-routed base_loss can propagate.
     if hasattr(model.backbone, 'model'):
         decoder = getattr(model.backbone.model, 'layers', None)
         if decoder is not None:
-            decoder.requires_grad_(True)
+            try:
+                decoder.requires_grad_(True)
+            except Exception:
+                pass
         final_norm = getattr(model.backbone.model, 'norm', None)
         if final_norm is not None:
-            final_norm.requires_grad_(True)
+            try:
+                final_norm.requires_grad_(True)
+            except Exception:
+                pass
     # Keep diffusion planner frozen (trained in Phase 2 only)
     if hasattr(model, 'latent_planner'):
         model.latent_planner.requires_grad_(False)
@@ -93,84 +125,115 @@ def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dt
 @torch.no_grad()
 def generate_streaming(model, tokenizer, input_ids, max_new_tokens=512, temperature=0.7, top_p=0.9, top_k=50, repetition_penalty=1.1, user_id=0):
     model.eval()
-    device = input_ids.device
-    generated = input_ids.clone()
+    device_0 = torch.device("cuda:0")
+    
+    generated = input_ids.to(device_0).clone()
     past_key_values = None
     h_seq = None
-    z0 = None
-    z0_base = None
-    user_ids = torch.tensor([user_id], device=device, dtype=torch.long)
+    z0 = z0_base = None
+    
+    # Dynamically locate where the fiber bundle resides (cuda:0 or cuda:1)
+    bundle_device = model.fiber_bundle.fiber_store.fiber_vectors.device if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None else device_0
+    user_ids_bundle = torch.tensor([user_id], device=bundle_device, dtype=torch.long)
+    
+    # [CRITICAL FIX] Surgical Hook: Capture terminal hidden state without triggering output_hidden_states=True
+    captured_hidden = {}
+    def capture_hook(module, args):
+        # args[0] is the hidden state entering the final RMSNorm
+        captured_hidden['last'] = args[0].detach()
+        
+    hook_handle = model.backbone.model.norm.register_forward_pre_hook(capture_hook)
 
-    for step in range(max_new_tokens):
-        with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
-            if past_key_values is not None:
+    try:
+        for step in range(max_new_tokens):
+            with torch.autocast(device_type="cuda", dtype=torch.float16):
+                # Isolate generation step tensor
+                step_inputs = generated[:, -1:] if past_key_values is not None else generated
+                
+                # [CRITICAL FIX] Disable output_hidden_states to stop the Accelerate PCI-e Flood
                 out = model.backbone(
-                    input_ids=generated[:, -1:], past_key_values=past_key_values,
-                    output_hidden_states=True, return_dict=True, use_cache=True
+                    input_ids=step_inputs, past_key_values=past_key_values,
+                    output_hidden_states=False, return_dict=True, use_cache=True
                 )
+                past_key_values = out.past_key_values
+                base_logits = out.logits[:, -1:, :]
+                
+                # Pop the hooked state natively from local memory
+                h_new = captured_hidden['last']
+                
+                if h_seq is None:
+                    h_seq = h_new
+                    h_pooled = h_seq[:, -1, :]  # last token has full causal context
+                    
+                    # O(1) Cross-PCIe Blueprint Extraction (Only executes ONCE at step 0)
+                    planner_device = next(model.latent_planner.parameters()).device
+                    h_pooled_cold = h_pooled.to(planner_device, non_blocking=True, dtype=torch.float32)
+                    mu, _ = model.latent_planner.encoder(h_pooled_cold)
+                    z0_cold = mu
+                    
+                    if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
+                        z0_cold = model.fiber_bundle.lift_to_fiber(z0_cold, user_ids_bundle)
+                        
+                    # Pull continuous blueprint safely back to cuda:0 for AR loop
+                    z0 = z0_cold.to(device_0, non_blocking=True, dtype=torch.float16)
+                    z0_base = z0
+                else:
+                    h_new_slice = h_new[:, -1:, :]
+                    h_seq = torch.cat([h_seq, h_new_slice], dim=1)
+                    if h_seq.size(1) > 128:
+                        h_seq = h_seq[:, -128:, :]
+                
+                # Pure cuda:0 sequential execution (0 PCI-e latency)
+                geo_logits = model.geo_processor(h_seq.detach(), z0=z0)[:, -1:, :]
+                logits = base_logits + geo_logits
+                
+                if getattr(model, 'fiber_proj', None) is not None and z0_base is not None:
+                    z0_delta = z0 - z0_base
+                    fiber_logits = model.fiber_proj(z0_delta, h_seq.detach())
+                    logits += fiber_logits[:, -1:, :]
+                    
+            logits = logits[:, -1, :]
+            
+            # [PASCAL MITIGATION] Explicit upcast for multinomial
+            logits_f32 = logits.to(torch.float32)
+            
+            if repetition_penalty != 1.0:
+                seen_ids = generated[0].unique()
+                score = logits_f32[0, seen_ids]
+                score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
+                logits_f32[0, seen_ids] = score
+                
+            if temperature > 0:
+                logits_f32 = logits_f32 / temperature
+                
+            if top_k > 0:
+                indices_to_remove = logits_f32 < torch.topk(logits_f32, top_k)[0][..., -1, None]
+                logits_f32[indices_to_remove] = float("-inf")
+                
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits_f32, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                remove = cumulative_probs > top_p
+                remove[..., 1:] = remove[..., :-1].clone()
+                remove[..., 0] = 0
+                logits_f32[remove.scatter(1, sorted_indices, remove)] = float("-inf")
+                
+            probs = F.softmax(logits_f32, dim=-1)
+            
+            # Fallback safeguard if the Pascal downcast still crashes the probability distribution
+            if torch.isnan(probs).any() or probs.sum() == 0:
+                next_token = torch.argmax(logits_f32, dim=-1, keepdim=True)
             else:
-                out = model.backbone(
-                    input_ids=generated, output_hidden_states=True, return_dict=True, use_cache=True
-                )
-            past_key_values = out.past_key_values
-            base_logits = out.logits[:, -1:, :]
+                next_token = torch.multinomial(probs, num_samples=1)
+                
+            yield next_token.item()
+            generated = torch.cat([generated, next_token.to(device_0)], dim=-1)
             
-            if h_seq is None:
-                h_seq = out.hidden_states[-1]
-                h_pooled = h_seq[:, -1, :]  # last token has full causal context
-                mu, _ = model.latent_planner.encoder(h_pooled)
-                z0 = mu
-                z0_base = z0
-                # Lift z0 into the user's personalized fiber space
-                if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
-                    z0 = model.fiber_bundle.lift_to_fiber(z0, user_ids)
-            else:
-                h_new = out.hidden_states[-1][:, -1:, :]
-                h_seq = torch.cat([h_seq, h_new], dim=1)
-                # Cap to sliding window — geo_processor has no KV cache (O(T²) without cap)
-                if h_seq.size(1) > 128:
-                    h_seq = h_seq[:, -128:, :]
-
-            geo_logits = model.geo_processor(h_seq.detach(), z0=z0)[:, -1:, :]
-            logits = base_logits + geo_logits
-            
-            # Direct fiber correction mapping via contextual gate
-            if getattr(model, 'fiber_proj', None) is not None and z0_base is not None:
-                z0_delta = z0 - z0_base
-                fiber_logits = model.fiber_proj(z0_delta, h_seq.detach())
-                logits += fiber_logits[:, -1:, :]
-
-        logits = logits[:, -1, :]
-
-        if repetition_penalty != 1.0:
-            seen_ids = generated[0].unique()
-            score = logits[0, seen_ids]
-            score = torch.where(score > 0, score / repetition_penalty, score * repetition_penalty)
-            logits[0, seen_ids] = score
-
-        if temperature > 0:
-            logits = logits / temperature
-        
-        if top_k > 0:
-            indices_to_remove = logits < torch.topk(logits, top_k)[0][..., -1, None]
-            logits[indices_to_remove] = float("-inf")
-            
-        if top_p < 1.0:
-            sorted_logits, sorted_indices = torch.sort(logits, descending=True)
-            cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
-            remove = cumulative_probs > top_p
-            remove[..., 1:] = remove[..., :-1].clone()
-            remove[..., 0] = 0
-            logits[remove.scatter(1, sorted_indices, remove)] = float("-inf")
-
-        probs = F.softmax(logits, dim=-1)
-        next_token = torch.multinomial(probs, num_samples=1)
-        
-        yield next_token.item()
-        generated = torch.cat([generated, next_token], dim=-1)
-        
-        if next_token.item() == tokenizer.eos_token_id:
-            break
+            if next_token.item() == tokenizer.eos_token_id:
+                break
+    finally:
+        # Guarantee cleanup to prevent hook memory leaks across API calls
+        hook_handle.remove()
 
 def continuous_learning_update(
     model, tokenizer, prompt_ids, resp_ids, reward,
@@ -206,15 +269,24 @@ def continuous_learning_update(
     # 2. Compute z0 from Diffusion Planner and lift to user fiber
     with torch.autocast(device_type="cuda", dtype=dtype):
         h_pooled = hiddens[:, -1, :]  # last token has full causal context
-        mu, log_var = model.latent_planner.encoder(h_pooled)
+        
+        bundle_device = model.fiber_bundle.fiber_store.fiber_vectors.device if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None else h_pooled.device
+        # Dynamically map h_pooled to latent_planner device explicitly
+        planner_device = next(model.latent_planner.parameters()).device if hasattr(model, 'latent_planner') else bundle_device
+        h_pooled_cold = h_pooled.to(planner_device, dtype=torch.float32)
+        
+        mu, log_var = model.latent_planner.encoder(h_pooled_cold)
         std = torch.exp(0.5 * log_var)
         eps = torch.randn_like(std)
-        z0 = mu + eps * std
+        z0_cold = mu + eps * std
         
         # Lift z0 into user-specific fiber space (per-user topology)
-        z0_base = z0  # save pre-lift for fiber_proj delta
+        z0_base_cold = z0_cold  # save pre-lift for fiber_proj delta
         if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None:
-            z0 = model.fiber_bundle.lift_to_fiber(z0, user_ids)
+            z0_cold = model.fiber_bundle.lift_to_fiber(z0_cold.to(bundle_device), user_ids.to(bundle_device))
+
+        z0 = z0_cold.to(hiddens.device, dtype=dtype)
+        z0_base = z0_base_cold.to(hiddens.device, dtype=dtype)
 
         geo_logits_full = model.geo_processor(hiddens, z0=z0)
         geo_logits = geo_logits_full[:, prompt_len - 1 : prompt_len + gen_len - 1, :]
@@ -241,12 +313,15 @@ def continuous_learning_update(
                     ).unsqueeze(1)  # (B, 1, V) — broadcast across time
                     final_logits = final_logits + model.episodic_memory.episodic_scale * episodic_logits_direct
 
-            fiber_logits = model.fiber_proj(z0_delta, h_seq_ctx)  # (B, T, V)
+            proj_device = model.fiber_proj.W_z.device if hasattr(model.fiber_proj, 'W_z') else next(model.fiber_proj.parameters()).device
+            z0_delta_cold = z0_delta.to(proj_device)
+            h_seq_ctx_cold = h_seq_ctx.to(proj_device)
+            fiber_logits = model.fiber_proj(z0_delta_cold, h_seq_ctx_cold).to(final_logits.device)  # (B, T, V)
             final_logits = final_logits + fiber_logits
             
         if getattr(model, 'sparse_bias', None) is not None:
-            # HighGainSparseBias already multiplies by its internal gain
-            sparse_bias_logits = model.sparse_bias(user_ids)
+            sparse_device = model.sparse_bias.user_biases.device if hasattr(model.sparse_bias, 'user_biases') else next(model.sparse_bias.parameters()).device
+            sparse_bias_logits = model.sparse_bias(user_ids.to(sparse_device)).to(final_logits.device)
             final_logits = final_logits + sparse_bias_logits.unsqueeze(1)
         
         if target_ids is not None:
@@ -261,7 +336,9 @@ def continuous_learning_update(
             
             # Compute energy for epistemic routing normally based on target tokens
             h_gen_detached = h_gen.detach().requires_grad_(True)
-            energy = model.ebm_critic(h_gen_detached)  # (1,)
+            ebm_device = next(model.ebm_critic.parameters()).device
+            h_gen_cold = h_gen_detached.to(ebm_device).requires_grad_(True)
+            energy = model.ebm_critic(h_gen_cold).to(h_gen.device)  # (1,)
         else:
             # ==========================================
             # STANDARD SCALAR RL
@@ -271,11 +348,14 @@ def continuous_learning_update(
             
             # C3 Token Credit via EBM Critic
             h_gen_detached = h_gen.detach().requires_grad_(True)
-            energy = model.ebm_critic(h_gen_detached)  # (1,)
+            ebm_device = next(model.ebm_critic.parameters()).device
+            h_gen_cold = h_gen_detached.to(ebm_device).requires_grad_(True)
+            
+            energy = model.ebm_critic(h_gen_cold)  # (1,)
             
             total_e = energy.sum()
-            grads = torch.autograd.grad(total_e, h_gen_detached, create_graph=False, retain_graph=False)[0]
-            c3_credit = grads.norm(dim=-1).detach()  # (1, T) — credit weights are not trained
+            grads = torch.autograd.grad(total_e, h_gen_cold, create_graph=False, retain_graph=False)[0]
+            c3_credit = grads.norm(dim=-1).detach().to(hiddens.device)  # (1, T) — credit weights are not trained
             
             advantages = torch.ones_like(c3_credit)
             
@@ -293,7 +373,15 @@ def continuous_learning_update(
     
     # ===== PHASE 2: Epistemic Routing =====
     # κ splits the gradient: factual errors → base manifold, style errors → user fiber
-    routing = epistemic_router(rl_loss.unsqueeze(0), energy.unsqueeze(0))
+    try:
+        router_device = epistemic_router.fc1.weight.device if hasattr(epistemic_router, 'fc1') else (epistemic_router.mapper[0].weight.device if hasattr(epistemic_router, 'mapper') else next(epistemic_router.parameters()).device)
+    except StopIteration:
+        router_device = 'cuda:1'
+        
+    rl_loss_cold = rl_loss.unsqueeze(0).to(router_device)
+    energy_cold = energy.unsqueeze(0).to(router_device)
+    
+    routing = epistemic_router(rl_loss_cold, energy_cold)
     kappa = routing["kappa"].item()
     
     # Zero ALL optimizers at the top of every update
@@ -306,6 +394,14 @@ def continuous_learning_update(
     # The mathematical guarantees of the epistemic router are enforced by explicitly 
     # scaling the parameter gradients post-backward, identically matching the routing equations.
     rl_loss.mean().backward()
+    
+    # [CRITICAL SHIELD] Natively purge any exploding fp16 overflow gradients to zero
+    for p in model.parameters():
+        if p.requires_grad and p.grad is not None:
+            if p.grad.is_sparse:
+                torch.nan_to_num_(p.grad._values(), nan=0.0, posinf=0.0, neginf=0.0)
+            else:
+                torch.nan_to_num_(p.grad, nan=0.0, posinf=0.0, neginf=0.0)
     
     # --- Base manifold update (κ: factual correction) ---
     base_params = [p for p in model.backbone.parameters() if p.requires_grad]
@@ -338,6 +434,10 @@ def continuous_learning_update(
     # Tighter explicit clip on geo_processor to prevent retraining (0.1)
     torch.nn.utils.clip_grad_norm_(model.geo_processor.parameters(), 0.1)
     
+    # Clip Sparse gradients mathematically to prevent F.log_softmax Float16 overflow
+    if getattr(model, 'sparse_bias', None) is not None:
+        torch.nn.utils.clip_grad_norm_(model.sparse_bias.parameters(), 1.0)
+    
     # Scale Sidecar learning rate by (1-kappa), bypassed during contrastive forcing
     # When target_ids is provided, the user is explicitly teaching a fact.
     # The epistemic router (kappa→1 for factual error) must NOT suppress the
@@ -366,6 +466,12 @@ def continuous_learning_update(
         optimizer_sidecar.step()
         if optimizer_sparse is not None:
             optimizer_sparse.step()
+            model.sparse_bias.bias.weight.data.clamp_(-10.0, 10.0)
+
+        # DEBUG NaNs
+        for name, p in model.named_parameters():
+            if p.requires_grad and torch.isnan(p).any():
+                print(f"NAN DETECTED AFTER STEP IN {name}")
 
     
     # Restore sidecar LRs

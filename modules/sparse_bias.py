@@ -51,10 +51,8 @@ class HighGainSparseBias(nn.Module):
     @torch.no_grad()
     def state_dict_differential(self) -> dict:
         """
-        O(1) Differential Checkpoint Serialization Strategy.
-        Instead of dumping 1.5B identically zeroed structural variables (6GB), 
-        filter explicit coordinates conditionally capturing uniquely modified metrics natively.
-        Returns a compressed dictionary isolating physical nonzero rows perfectly natively.
+        Save only non-zero user rows instead of the full embedding matrix.
+        For 10k users × 150k vocab, this avoids writing 6GB of zeros.
         """
         weights = self.bias.weight.data
         # Efficient row-wise norm to find active users
@@ -70,10 +68,10 @@ class HighGainSparseBias(nn.Module):
     @torch.no_grad()
     def load_state_dict_differential(self, state_dict: dict):
         """
-        Loads highly compressed differential structural IO vectors natively back into execution arrays identically globally mapping accurately linearly perfectly globally directly correctly perfectly precisely intrinsically natively.
+        Load a differential checkpoint saved by state_dict_differential.
         """
         if "active_indices" not in state_dict:
-            raise KeyError("Invalid differential state dictionary provided natively.")
+            raise KeyError("Invalid differential state dictionary: missing 'active_indices' key.")
             
         indices = state_dict["active_indices"].to(self.bias.weight.device)
         weights = state_dict["active_weights"].to(self.bias.weight.dtype).to(self.bias.weight.device)

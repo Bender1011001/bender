@@ -104,7 +104,7 @@ def row_mahalanobis(X: Tensor, mu: Tensor, Sigma_inv: Tensor) -> Tensor:
             -1
         )  # (..., n)
 
-        # Algebraic separation mathematically preventing large O(n*d) intermediate instantiation
+        # Algebraic expansion avoids materializing an O(n*d) intermediate tensor
         return norm_X + norm_mu - cross_term
     else:
         # Full precision matrix fallback
@@ -137,7 +137,7 @@ def squared_riemannian_distance(h: Tensor, B: Tensor, G: Tensor) -> Tensor:
         h = h.unsqueeze(-2)  # (..., 1, d)
     diff = h - B  # (..., n, d)
 
-    # Apply generalized metric constraints via Native Batched Matmul broadcasting identically across topologies!
+    # Apply metric tensor via batched matmul
     transformed = diff @ G  # (..., n, d)
     return (transformed * diff).sum(dim=-1)  # (..., n)
 

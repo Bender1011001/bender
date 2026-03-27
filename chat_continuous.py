@@ -85,7 +85,7 @@ def load_v2_system(backbone_id: str, sidecar_path: str, device: str = "cuda", dt
     hot_device = torch.device("cuda:0")
     cold_device = torch.device("cuda:1") if torch.cuda.device_count() > 1 else hot_device
     
-    # Fast-path AR components stay on cuda:0 natively
+    # Fast-path AR components stay on cuda:0
     model.geo_processor = model.geo_processor.to(hot_device, dtype=dtype)
     if getattr(model, 'fiber_proj', None) is not None:
         model.fiber_proj = model.fiber_proj.to(hot_device, dtype=dtype)
@@ -162,7 +162,7 @@ def generate_streaming(model, tokenizer, input_ids, max_new_tokens=512, temperat
                 past_key_values = out.past_key_values
                 base_logits = out.logits[:, -1:, :]
                 
-                # Pop the hooked state natively from local memory
+                # Clear the hooked state from local memory
                 h_new = captured_hidden['last']
                 
                 if h_seq is None:
@@ -275,7 +275,7 @@ def continuous_learning_update(
         h_pooled = hiddens[:, -1, :]  # last token has full causal context
         
         bundle_device = model.fiber_bundle.fiber_store.fiber_vectors.device if hasattr(model, 'fiber_bundle') and model.fiber_bundle is not None else h_pooled.device
-        # Dynamically map h_pooled to latent_planner device explicitly
+        # Map h_pooled to latent_planner device
         planner_device = next(model.latent_planner.parameters()).device if hasattr(model, 'latent_planner') else bundle_device
         h_pooled_cold = h_pooled.to(planner_device, dtype=torch.float32)
         
@@ -396,10 +396,10 @@ def continuous_learning_update(
     
     # Use a unified backward pass to prevent PyTorch inplace modification graph crashes.
     # The mathematical guarantees of the epistemic router are enforced by explicitly 
-    # scaling the parameter gradients post-backward, identically matching the routing equations.
+    # Scale parameter gradients post-backward to match the routing equations.
     rl_loss.mean().backward()
     
-    # [CRITICAL SHIELD] Natively purge any exploding fp16 overflow gradients to zero
+    # Purge any exploding fp16 overflow gradients to zero
     for p in model.parameters():
         if p.requires_grad and p.grad is not None:
             if p.grad.is_sparse:
@@ -438,7 +438,7 @@ def continuous_learning_update(
     # Tighter explicit clip on geo_processor to prevent retraining (0.1)
     torch.nn.utils.clip_grad_norm_(model.geo_processor.parameters(), 0.1)
     
-    # Clip Sparse gradients mathematically to prevent F.log_softmax Float16 overflow
+    # Clip sparse gradients to prevent F.log_softmax Float16 overflow
     if getattr(model, 'sparse_bias', None) is not None:
         torch.nn.utils.clip_grad_norm_(model.sparse_bias.parameters(), 1.0)
     

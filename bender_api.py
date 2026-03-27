@@ -54,7 +54,7 @@ async def startup_event():
     print("Loading Dual-System V2 backend...")
     model, tokenizer = load_v2_system(backbone_id, sidecar_path)
     
-    # [CRITICAL SHIELD] Upcast sidecar parameters to FP32. AdamW `v = g^2` natively 
+    # Upcast sidecar parameters to FP32. AdamW v = g^2 
     # overflows FP16 max value (65504) causing irreversible NaN logic collapse globally.
     model.geo_processor.to(torch.float32)
     model.ebm_critic.to(torch.float32)

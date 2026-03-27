@@ -27,38 +27,41 @@ Exhaustive recall — every stored fact queried individually, not sampled.
 |---|---|---|---|
 | Qwen2.5 7B | Dense standard | 3584 | 1000/1000 ✅ |
 | Gemma2 9B | Dense sliding window | 3584 | 1000/1000 ✅ |
-| Qwen3-30B-A3B-Instruct-2507 | Sparse 128-expert | 2048 | 1000/1000 ✅ |
+| Qwen3-30B-A3B | Sparse 128-expert MoE | 2048 | 1000/1000 ✅ |
 
 Multi-user isolation: 6/6 — users cannot access each other's memories.  
 Grammar stability: clean through 20 rounds of continuous training.
 
 Logs: `/logs/scale_1000_exhaustive_pass.log`
 
-## BENDER vs. Standard RAG (In-Context Learning)
-To prove the mathematical dominance of topological sidecar memory over standard vector-search Context window injection (RAG), both frameworks were queried identically to recall distinct synthesized properties across scaling dense context bounds.
+## BENDER vs. Context-Window Stuffing
 
-| Paradigm | Architecture | Limit $N=50$ | Limit $N=250$ | Limit $N=500$ | Limit $N=1000$ | Latency Scaling |
+To test scaling behavior, both frameworks were queried identically to recall distinct facts across increasing context sizes. The RAG baseline prepends all facts as text into the prompt (context stuffing). This is the simplest RAG approach — a production RAG system with vector search and top-k retrieval would perform better than this baseline.
+
+| Paradigm | Architecture | N=50 | N=250 | N=500 | N=1000 | Latency Scaling |
 | :--- | :--- | :--- | :--- | :--- | :--- | :--- |
-| **Traditional RAG** | Gemma-2-9B (Base) | 100.0% ($0.39s$) | 70.0% ($0.77s$) | 20.0% ($1.35s$) | 0.0% ($2.12s$ OOM) | Exponential ($O(N^2)$) |
-| **BENDER Memory** | Gemma-2-9B (+ Sidecar) | **100.0%** ($0.83s$) | **100.0%** ($0.85s$) | **100.0%** ($0.80s$) | **100.0%** ($0.86s$) | **$O(1)$ Constant** |
+| **Context Stuffing** | Gemma-2-9B (Base) | 100.0% (0.39s) | 70.0% (0.77s) | 20.0% (1.35s) | 0.0% (OOM) | O(N²) attention |
+| **BENDER Memory** | Gemma-2-9B (+ Sidecar) | **100.0%** (0.83s) | **100.0%** (0.85s) | **100.0%** (0.80s) | **100.0%** (0.86s) | **Constant** |
 
-*RAG structurally collapses to 20% accuracy at N=500 due to attention dilution ("Lost in the Middle"). BENDER maps memory mathematically through `embed_tokens.weight.T`, maintaining pristine 100.0% differentiation indefinitely with zero prompt-token latency overhead.*
+Context stuffing collapses due to attention dilution ("Lost in the Middle") and eventually OOMs. BENDER's episodic memory retrieves via `embed_tokens.weight.T` projection, maintaining constant latency regardless of memory count.
 
----
-
-## Update: 25-Agent Continuously Learning Town Simulation (N=25) 
-**Zero Memory Bleed. Zero Frame Drops. Constant Latency.**
-We successfully migrated the **Smallville (N=25)** multi-agent generative town simulation onto this exact 6GB 4060Ti dual-GPU framework. The 25 agents operate independently and push memory into the topology synchronously without generating cross-character contamination or context truncation. 
-
-BENDER fully replaces the external Vector Database natively. No 15-minute generation loops crashing to `cuda:OOM` errors. The mathematical architecture inherently evaluates isolation across 25 simultaneous lifelong-learning memory injections flawlessly. `bender_api.py` is provided as a drop-in `/generate` and `/inject_memory` endpoint to run generative frameworks locally zero-overhead.
+**Note:** The memory buffer is a fixed-size circular buffer (`max_memories` slots per user). Latency is constant because the buffer size is constant — not because the architecture handles unlimited memories. For most use cases (chatbot, agent, persona), the default capacity is more than sufficient.
 
 ---
 
-## Why two architectures matter
+## 25-Agent Town Simulation (Smallville, N=25)
 
-Qwen uses standard dense attention. Gemma 2 uses alternating local/global sliding window attention — a fundamentally different internal structure. BENDER reads from `hidden_states[-1]` in both cases and gets clean retrieval geometry either way.
+We migrated the Smallville multi-agent generative town simulation onto this framework. 25 agents operate independently with persistent memory, zero cross-character contamination, and constant latency — replacing the original external vector database entirely.
 
-This means the sidecar is genuinely backbone-agnostic. If your model exposes `hidden_states` through HuggingFace's standard interface, it should work.
+`bender_api.py` provides drop-in `/generate` and `/inject_memory` FastAPI endpoints.
+
+---
+
+## Backbone-agnostic
+
+Qwen uses standard dense attention. Gemma 2 uses alternating local/global sliding window attention. Qwen3-30B-A3B uses sparse 128-expert MoE with a different hidden dimension. BENDER reads from `hidden_states[-1]` in all cases and gets clean retrieval geometry either way.
+
+If your model exposes `hidden_states` through HuggingFace's standard interface, it should work.
 
 ---
 
@@ -94,24 +97,22 @@ The demo injects one fact and queries it back. You should see the target keyword
 bender/
   dual_system_v2.py       — main model class, wraps any HF backbone
   chat_continuous.py      — memory write path (continuous_learning_update)
+  demo.py                 — one command, see it work
+  bender_api.py           — FastAPI wrapper for multi-agent deployments
+
   modules/
     episodic_memory.py    — retrieval, hybrid scoring, Viterbi lock
     sparse_bias.py        — per-user vocab bias with decay
     fiber_bundle.py       — per-user style personalization (SO(d) fibers)
-    epistemic_router.py   — routes RL gradients: factual vs style errors
-    bch_consolidation.py  — lifelong consolidation via BCH expansion
-
-  bender_api.py           — FastAPI wrapper for scalable drop-in (N=25 Agent framework replacements)
+    geometry.py           — Cayley map, skew-symmetric utilities
+    diffusion_planner.py  — latent blueprint encoder (VAE)
+    epistemic_router.py   — routes learning: factual vs style errors
+    bch_consolidation.py  — lifelong fiber consolidation via BCH expansion
 
 benchmarks/
   test_capacity_scale.py      — exhaustive N-fact recall test
   test_multi_user_isolation.py — cross-user isolation
-  test_repetition_recall.py   — 400-round regression
-
-logs/
-  scale_1000_exhaustive_pass.log  — 1000/1000 result on Qwen 7B
-
-demo.py   — one command, see it work
+  test_repetition_recall.py   — multi-round regression
 ```
 
 ---
@@ -119,8 +120,8 @@ demo.py   — one command, see it work
 ## Known limitations
 
 - Fact capacity depends on prompt diversity. Synthetic benchmarks use maximally similar prompts (stress test). Real user queries are more semantically distinct and easier to retrieve.
-- The sidecar needs a one-time training run to initialize. A pre-trained checkpoint is available on HuggingFace: [`Bender1011001/Qwen2.5-3B-DualSystem-V2`](https://huggingface.co/Bender1011001/Qwen2.5-3B-DualSystem-V2). You don't retrain it per user — only the episodic memory writes at inference time.
-- `hidden_states[-1]` extraction is definitively mathematically invariant across Qwen (Dense), Gemma (Sliding Window), and Qwen3 (Sparse 128-MoE) architectures seamlessly natively!
+- The sidecar needs a one-time training run to initialize. A pre-trained checkpoint is available on HuggingFace: [`Bender1011001/Qwen2.5-3B-DualSystem-V2`](https://huggingface.co/Bender1011001/Qwen2.5-3B-DualSystem-V2).
+- Memory is stored in a fixed-size circular buffer per user. Once full, oldest memories are overwritten.
 
 ---
 

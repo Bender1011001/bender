@@ -498,7 +498,7 @@ class DualSystemV2(nn.Module):
             ebm_neg = torch.stack(neg_energies).mean(dim=0) # Aggregate negatives per sequence before batch mean
             
             # BCE Loss on Energies: Positives pulled towards 0 (low energy), Negatives pulled towards 1 (high energy)
-            # This strictly bounds the scaler explosion mathematically.
+            # BCE loss bounds the energy scalar to prevent unbounded growth.
             ebm_loss = F.binary_cross_entropy_with_logits(
                 energy, torch.zeros_like(energy)
             ) + F.binary_cross_entropy_with_logits(
